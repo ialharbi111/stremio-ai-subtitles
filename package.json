@@ -1,0 +1,23 @@
+{
+  "name": "stremio-ai-arabic-subtitles",
+  "version": "1.0.0",
+  "description": "إضافة Stremio تترجم الترجمة الإنجليزية إلى العربية تلقائياً باستخدام Gemini AI مع الحفاظ الكامل على التوقيت",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
