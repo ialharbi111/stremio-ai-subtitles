@@ -92,14 +92,14 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
 }
 
 /**
- * دالة وسيطة تجبر الطلبات على المرور عبر "الطابور الموحد" وتفرض تأخير 4.5 ثانية بين كل عملية وأخرى
+ * دالة وسيطة تجبر الطلبات على المرور عبر "الطابور الموحد" وتفرض تأخير أمن جداً بين كل عملية وأخرى
  */
 function queuedTranslateBatch({ batch, systemInstruction }) {
   return new Promise((resolve, reject) => {
     // نربط الطلب الحالي بنهاية الطابور العالمي
     globalQueue = globalQueue.then(async () => {
-      // ننتظر 4.5 ثوانٍ كاملة قبل إرسال الطلب لـ Gemini لضمان عدم تخطي الـ Rate Limit
-      await delay(4500);
+      // ننتظر 8 ثوانٍ كاملة (8000ms) للأمان القصوى لضمان عدم تخطي الـ Rate Limit
+      await delay(8000);
       try {
         const res = await translateBatch({ batch, systemInstruction });
         resolve(res);
@@ -139,13 +139,12 @@ async function translateSrt({ srtContent, imdbId, season }) {
     console.log(`⏳ [طابور الانتظار] تجهيز الدفعة ${i + 1} من أصل ${batches.length}...`);
     
     try {
-      // نستدعي الدالة المجدولة في الطابور بدلاً من translateBatch مباشرة
       const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
       translatedBatches.push(translatedBatch);
       console.log(`✅ تم ترجمة الدفعة ${i + 1} بنجاح.`);
     } catch (err) {
-      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم إعادة المحاولة بإدراجها بالطابور مجدداً بعد 10 ثوانٍ...`);
-      await delay(10000);
+      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم إعادة المحاولة بعد فترة نقاهة (15 ثانية)...`);
+      await delay(15000); // فترة نقاهة أطول عند الفشل
       try {
         const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
         translatedBatches.push(translatedBatch);
@@ -165,48 +164,9 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const arabicSrt = buildSrt(entries);
 
-  updateGlossaryInBackground({ imdbId: seriesKey, texts, translatedTexts }).catch((err) => {
-    console.warn('تعذّر تحديث ذاكرة المصطلحات:', err.message);
-  });
+  // تم إلغاء تحديث المصطلحات بالخلفية مؤقتاً لتوفير الـ Quota للترجمة الفعلية
 
   return arabicSrt;
-}
-
-/**
- * تحديث ذاكرة المصطلحات
- */
-async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
-  const sampleSize = Math.min(120, texts.length);
-  const step = Math.max(1, Math.floor(texts.length / sampleSize));
-  const pairs = [];
-  for (let i = 0; i < texts.length; i += step) {
-    pairs.push({ en: texts[i], ar: translatedTexts[i] });
-  }
-
-  const model = genAI.getGenerativeModel({
-    model: MODEL_NAME,
-    systemInstruction: `مهمتك استخراج أسماء الأعلام (شخصيات، أماكن، ألقاب) والتعبيرات المتكررة المهمة فقط من أزواج الجمل (إنجليزي/عربي) التالية، وإرجاعها كمصفوفة JSON بالشكل: [{"en": "...", "ar": "..."}]. تجاهل الجمل العادية. أرجع مصفوفة فارغة [] إن لم تجد شيئاً مهماً. لا تُرجع أي نص خارج الـ JSON.`,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.1,
-    },
-  });
-
-  // ندرج استدعاء الـ Glossary أيضاً تحت الطابور لحمايته من الـ Rate Limit
-  globalQueue = globalQueue.then(async () => {
-    await delay(4500);
-    try {
-      const result = await model.generateContent(JSON.stringify(pairs));
-      const rawText = result.response.text();
-      const terms = extractJsonArray(rawText);
-
-      if (Array.isArray(terms) && terms.length > 0) {
-        upsertGlossaryTerms(imdbId, terms);
-      }
-    } catch (err) {
-      console.warn('تعذر استخراج المصطلحات في الخلفية:', err.message);
-    }
-  });
 }
 
 module.exports = { translateSrt };
