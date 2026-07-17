@@ -7,6 +7,11 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const MODEL_NAME = 'gemini-flash-latest'; // alias يتحدّث تلقائياً لأحدث نموذج Flash متوفر من Google
 const BATCH_SIZE = 90; // عدد أسطر الحوار في كل طلب - يوازن بين السرعة وحجم الاستجابة
 
+/**
+ * دالة مساعدة لعمل تأخير (Delay) بالملي ثانية
+ */
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 function buildSystemInstruction({ glossary, styleNotes }) {
   let glossaryBlock = '';
   if (glossary && glossary.length > 0) {
@@ -104,10 +109,38 @@ async function translateSrt({ srtContent, imdbId, season }) {
   const systemInstruction = buildSystemInstruction({ glossary, styleNotes });
 
   const batches = chunkArray(texts, BATCH_SIZE);
+  console.log(`📦 تم تقسيم الملف إلى ${batches.length} دفعة للترجمة.`);
 
-  const translatedBatches = await Promise.all(
-    batches.map((batch) => translateBatch({ batch, systemInstruction }))
-  );
+  const translatedBatches = [];
+
+  // معالجة الدفعات بالتتالي واحداً تلو الآخر لتجنب خطأ الـ Rate Limit لـ Gemini Free Tier
+  for (let i = 0; i < batches.length; i++) {
+    console.log(`⏳ جاري ترجمة الدفعة ${i + 1} من أصل ${batches.length}...`);
+    const startTime = Date.now();
+
+    try {
+      const translatedBatch = await translateBatch({ batch: batches[i], systemInstruction });
+      translatedBatches.push(translatedBatch);
+    } catch (err) {
+      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم المحاولة مجدداً بعد 10 ثوانٍ...`);
+      await delay(10000); // فترة نقاهة 10 ثوانٍ قبل إعادة المحاولة
+      const translatedBatch = await translateBatch({ batch: batches[i], systemInstruction });
+      translatedBatches.push(translatedBatch);
+    }
+
+    // الانتظار الإلزامي لمنع تخطي 15 طلباً بالدقيقة (Free Tier Rate Limit)
+    // نضع 4.5 ثانية (4500ms) كأمان تام بين انطلاق كل طلب وتاليه
+    const duration = Date.now() - startTime;
+    const requiredDelay = 4500; 
+
+    if (i < batches.length - 1) {
+      const sleepTime = Math.max(0, requiredDelay - duration);
+      if (sleepTime > 0) {
+        console.log(`😴 الانتظار لمدة ${(sleepTime / 1000).toFixed(1)} ثانية لتفادي الـ Rate Limit لـ Gemini...`);
+        await delay(sleepTime);
+      }
+    }
+  }
 
   const translatedTexts = translatedBatches.flat();
 
