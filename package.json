@@ -12,6 +12,7 @@
     "axios": "^1.7.7",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "jszip": "^3.10.1",
     "stremio-addon-sdk": "^1.6.10"
   },
   "devDependencies": {
