@@ -4,21 +4,14 @@ const { getGlossaryForSeries, upsertGlossaryTerms, getStyleNotes } = require('./
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const MODEL_NAME = 'gemini-flash-latest'; // alias يتحدّث تلقائياً لأحدث نموذج Flash متوفر من Google
-const BATCH_SIZE = 90; // عدد أسطر الحوار في كل طلب - يوازن بين السرعة وحجم الاستجابة
+const MODEL_NAME = 'gemini-flash-latest'; 
+const BATCH_SIZE = 80; // حجم الدفعة المثالي لضمان ثبات الاستجابة بالـ IDs
 
-/**
- * دالة مساعدة لعمل تأخير (Delay) بالملي ثانية
- */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// متغير عالمي لحفظ وقت آخر طلب تم إرساله لـ Gemini على مستوى السيرفر بالكامل
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 5000; // 5 ثوانٍ كحد أدنى بين أي طلبين لـ Gemini (أمان تام لـ Free Tier)
+const MIN_REQUEST_INTERVAL = 4000; // 4 ثوانٍ فقط (سريع وآمن جداً)
 
-/**
- * منظم الطلبات العالمي: يضمن عدم خروج أي طلب لـ Gemini قبل مرور 5 ثوانٍ على الطلب السابق
- */
 async function throttledGenerateContent(model, prompt) {
   const now = Date.now();
   const timeSinceLastRequest = now - lastRequestTime;
@@ -28,9 +21,7 @@ async function throttledGenerateContent(model, prompt) {
     await delay(waitTime);
   }
   
-  // تحديث وقت الطلب فوراً لحجز الدور للطلب التالي
   lastRequestTime = Date.now();
-  
   return await model.generateContent(prompt);
 }
 
@@ -39,22 +30,28 @@ function buildSystemInstruction({ glossary, styleNotes }) {
   if (glossary && glossary.length > 0) {
     const lines = glossary.map((g) => `- "${g.term_en}" => "${g.term_ar}"`).join('\n');
     glossaryBlock = `
-قائمة مصطلحات وأسماء يجب الالتزام الحرفي بترجمتها كما وردت (تم اعتمادها في حلقات سابقة من نفس المسلسل):
+قائمة مصطلحات وأسماء يجب الالتزام الحرفي بترجمتها:
 ${lines}
 `;
   }
 
   const styleBlock = styleNotes ? `\nملاحظات أسلوبية إضافية: ${styleNotes}\n` : '';
 
-  return `أنت مترجم محترف متخصص في ترجمة الأفلام والمسلسلات من الإنجليزية إلى العربية الفصحى السلسة والمناسبة للمشاهدة (ليست عربية أكاديمية جامدة، بل لغة فصحى طبيعية تصلح للحوار الدرامي).
+  return `أنت مترجم محترف متخصص في ترجمة الأفلام والمسلسلات من الإنجليزية إلى العربية الفصحى السلسة والمناسبة للمشاهدة.
 
-قواعد صارمة يجب الالتزام بها دائماً:
-1. تُرجم فقط، لا تضف أي شرح أو تعليق أو ملاحظات خارج النص المترجم.
-2. حافظ على المعنى والنبرة (فكاهي، جاد، عاطفي...) بما يناسب السياق.
-3. لا تترجم حرفياً كلمة بكلمة؛ اجعل الجملة تبدو طبيعية بالعربية.
-4. حافظ على علامات الترقيم المناسبة للعربية.
-5. إذا كان النص يحتوي على اسم علم (شخصية) لم يرد في القائمة أدناه, اختر نقحرة عربية ثابتة له والتزم بها.
-6. أعد النتيجة بصيغة JSON فقط (مصفوفة نصوص) بنفس عدد وترتيب العناصر المُدخلة، دون أي نص إضافي قبلها أو بعدها.
+ستتلقى مصفوفة كائنات بصيغة JSON تحتوي على معرف "id" ونص "text".
+مهمتك ترجمة حقل "text" فقط إلى العربية الفصحى السلسة، وإرجاع مصفوفة JSON بنفس المعرفات (id) تماماً.
+
+مثال للمدخلات:
+[{"id": 1, "text": "Go home."}, {"id": 2, "text": "No way!"}]
+
+مثال للمخرجات المتوقعة منك:
+[{"id": 1, "text": "اذهب إلى المنزل."}, {"id": 2, "text": "مستحيل!"}]
+
+قواعد صارمة:
+1. تُرجم فقط النص، ولا تضف أي شرح أو تعليق خارج الـ JSON.
+2. حافظ على الـ "id" الخاص بكل سطر كما هو دون تعديل أو حذف.
+3. لا تترجم حرفياً؛ اجعل الصياغة طبيعية ودرامية ممتازة للمشاهدة بالعربية.
 ${glossaryBlock}${styleBlock}`;
 }
 
@@ -72,7 +69,7 @@ function extractJsonArray(rawText) {
 }
 
 /**
- * ترجمة الدفعة مع آلية إعادة المحاولة الذكية والمستقلة (حتى 3 محاولات)
+ * ترجمة دفعة تعتمد على نظام الـ IDs لضمان مطابقة التوقيت بنسبة 100%
  */
 async function translateBatchWithRetry({ batch, systemInstruction, maxAttempts = 3 }) {
   const model = genAI.getGenerativeModel({
@@ -84,86 +81,96 @@ async function translateBatchWithRetry({ batch, systemInstruction, maxAttempts =
     },
   });
 
-  const prompt = JSON.stringify(batch);
+  // نرسل مصفوفة تحتوي على الـ id والـ text لتفادي أي لبطة أو ترحيل بالتوقيت
+  const payload = batch.map(item => ({ id: item.id, text: item.text }));
+  const prompt = JSON.stringify(payload);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // إرسال الطلب عبر المنظم العالمي المفرمل للسرعة
       const result = await throttledGenerateContent(model, prompt);
       const rawText = result.response.text();
-      const translated = extractJsonArray(rawText);
+      const translatedList = extractJsonArray(rawText);
 
-      if (Array.isArray(translated) && translated.length === batch.length) {
-        return translated;
+      if (Array.isArray(translatedList)) {
+        // نصنع خريطة Map للترجمات المستلمة لتسهيل مطابقتها بالـ ID
+        const translatedMap = new Map();
+        translatedList.forEach(item => {
+          if (item && item.id !== undefined) {
+            translatedMap.set(item.id, item.text);
+          }
+        });
+        return translatedMap;
       }
-      throw new Error("الترجمة المستلمة لا تطابق عدد الأسطر الأصلي أو ليست مصفوفة صالحة.");
+      throw new Error("الترجمة المستلمة ليست مصفوفة JSON صالحة.");
     } catch (err) {
       console.error(`⚠️ فشلت الدفعة (محاولة ${attempt}/${maxAttempts}) بسبب: ${err.message}`);
       if (attempt < maxAttempts) {
-        const cooldown = attempt * 6000; // فترة نقاهة تزيد تصاعدياً (6 ثوانٍ، ثم 12 ثانية)
-        console.log(`😴 الانتظار لمدة ${cooldown / 1000} ثانية كفترة نقاهة قبل إعادة المحاولة...`);
+        const cooldown = attempt * 5000;
+        console.log(`😴 الانتظار لمدة ${cooldown / 1000} ثوانٍ قبل إعادة المحاولة...`);
         await delay(cooldown);
       }
     }
   }
 
-  console.warn('❌ فشلت جميع المحاولات لهذه الدفعة، سيتم استخدام النص الأصلي كملجأ أخير.');
-  return batch;
+  console.warn('❌ فشلت المحاولات، سيتم الإبقاء على النص الأصلي لهذه الدفعة حفاظاً على المزامنة.');
+  return new Map(); // نرجع خريطة فارغة في حال الفشل التام ليبقى النص الأصلي مكانه بدقة
 }
 
 /**
- * الدالة الرئيسية: تأخذ ملف SRT إنجليزي كامل وتُعيد نسخته العربية
+ * الدالة الرئيسية
  */
 async function translateSrt({ srtContent, imdbId, season }) {
   const entries = parseSrt(srtContent);
-  console.log(`🔍 تشخيص: طول محتوى SRT المستلم = ${srtContent ? srtContent.length : 0} حرف`);
-  console.log(`🔍 تشخيص: عدد الأسطر المستخرجة من الملف = ${entries.length}`);
-  if (entries.length === 0 && srtContent) {
-    console.log('🔍 أول 300 حرف من الملف المستلم (لفحص الصيغة):');
-    console.log(srtContent.slice(0, 300));
-  }
+  console.log(`🔍 عدد الأسطر المستخرجة من ملف الـ SRT = ${entries.length}`);
 
-  const texts = entries.map((e) => e.text);
+  // نربط كل سطر بالـ Index (الترتيب) الخاص به كـ ID فريد
+  const itemsToTranslate = entries.map((e, index) => ({
+    id: index,
+    text: e.text
+  }));
 
   const seriesKey = imdbId; 
   const glossary = getGlossaryForSeries(seriesKey);
   const styleNotes = getStyleNotes(seriesKey);
   const systemInstruction = buildSystemInstruction({ glossary, styleNotes });
 
-  const batches = chunkArray(texts, BATCH_SIZE);
+  const batches = chunkArray(itemsToTranslate, BATCH_SIZE);
   console.log(`📦 تم تقسيم الملف إلى ${batches.length} دفعة للترجمة.`);
 
-  const translatedBatches = [];
+  const allTranslationsMap = new Map();
 
-  // معالجة الدفعات بالتوالي وبشكل منظم وآمن تماماً
   for (let i = 0; i < batches.length; i++) {
     console.log(`⏳ جاري ترجمة الدفعة ${i + 1} من أصل ${batches.length}...`);
     
-    const translatedBatch = await translateBatchWithRetry({ batch: batches[i], systemInstruction });
-    translatedBatches.push(translatedBatch);
+    const translatedBatchMap = await translateBatchWithRetry({ batch: batches[i], systemInstruction });
+    
+    // دمج الترجمات الناجحة في الخريطة الكبرى
+    for (const [id, text] of translatedBatchMap.entries()) {
+      allTranslationsMap.set(id, text);
+    }
     
     console.log(`✅ انتهت معالجة الدفعة ${i + 1}.`);
   }
 
-  const translatedTexts = translatedBatches.flat();
-
-  entries.forEach((entry, i) => {
-    entry.text = translatedTexts[i] || entry.text;
+  // دمج الترجمات بملف الـ SRT الأصلي بالاعتماد على الـ ID (المطابقة المستحيل تخطئ)
+  entries.forEach((entry, index) => {
+    if (allTranslationsMap.has(index)) {
+      entry.text = allTranslationsMap.get(index);
+    }
   });
 
   const arabicSrt = buildSrt(entries);
 
-  // تحديث ذاكرة المصطلحات في الخلفية (تم تمريرها عبر المنظم لتفادي تعارض الـ Rate Limit)
-  updateGlossaryInBackground({ imdbId: seriesKey, texts, translatedTexts }).catch((err) => {
+  // استخراج الكلمات المفتاحية في الخلفية (كود كلاود بكامل قوته)
+  const texts = entries.map(e => e.text);
+  const originalTexts = itemsToTranslate.map(e => e.text);
+  updateGlossaryInBackground({ imdbId: seriesKey, texts: originalTexts, translatedTexts: texts }).catch((err) => {
     console.warn('تعذّر تحديث ذاكرة المصطلحات:', err.message);
   });
 
   return arabicSrt;
 }
 
-/**
- * يستخرج أسماء الشخصيات والمصطلحات المتكررة من هذه الحلقة ويحفظها
- */
 async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
   const sampleSize = Math.min(120, texts.length);
   const step = Math.max(1, Math.floor(texts.length / sampleSize));
@@ -174,7 +181,7 @@ async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
 
   const model = genAI.getGenerativeModel({
     model: MODEL_NAME,
-    systemInstruction: `مهمتك استخراج أسماء الأعلام (شخصيات، أماكن، ألقاب) والتعبيرات المتكررة المهمة فقط من أزواج الجمل (إنجليزي/عربي) التالية، وإرجاعها كمصفوفة JSON بالشكل: [{"en": "...", "ar": "..."}]. تجاهل الجمل العادية. أرجع مصفوفة فارغة [] إن لم تجد شيئاً مهماً. لا تُرجع أي نص خارج الـ JSON.`,
+    systemInstruction: `مهمتك استخراج أسماء الأعلام والتعبيرات المتكررة المهمة فقط من أزواج الجمل التالية، وإرجاعها كمصفوفة JSON بالشكل: [{"en": "...", "ar": "..."}]. لا تضف أي شرح خارجي.`,
     generationConfig: {
       responseMimeType: 'application/json',
       temperature: 0.1,
@@ -182,7 +189,6 @@ async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
   });
 
   try {
-    // إرسال طلب المصطلحات عبر منظم البوابة الموحد لعدم تخطي الـ Rate Limit
     const result = await throttledGenerateContent(model, JSON.stringify(pairs));
     const rawText = result.response.text();
     const terms = extractJsonArray(rawText);
@@ -192,7 +198,7 @@ async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
       console.log('✨ تم تحديث ذاكرة المصطلحات للمسلسل بنجاح في الخلفية.');
     }
   } catch (err) {
-    console.warn('⚠️ تعذر استخراج المصطلحات في الخلفية بسبب تعارض بالـ Rate Limit:', err.message);
+    console.warn('⚠️ تعذر استخراج المصطلحات في الخلفية:', err.message);
   }
 }
 
