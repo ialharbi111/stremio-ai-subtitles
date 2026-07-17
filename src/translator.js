@@ -89,6 +89,13 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
  */
 async function translateSrt({ srtContent, imdbId, season }) {
   const entries = parseSrt(srtContent);
+  console.log(`🔍 تشخيص: طول محتوى SRT المستلم = ${srtContent ? srtContent.length : 0} حرف`);
+  console.log(`🔍 تشخيص: عدد الأسطر المستخرجة من الملف = ${entries.length}`);
+  if (entries.length === 0 && srtContent) {
+    console.log('🔍 أول 300 حرف من الملف المستلم (لفحص الصيغة):');
+    console.log(srtContent.slice(0, 300));
+  }
+
   const texts = entries.map((e) => e.text);
 
   const seriesKey = imdbId; // يمكن تعديلها لاحقاً لتكون خاصة بالموسم إن رغبت
