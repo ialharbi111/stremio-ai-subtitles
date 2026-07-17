@@ -19,7 +19,7 @@ if (!process.env.OPENSUBTITLES_API_KEY || process.env.OPENSUBTITLES_API_KEY.incl
 const manifest = {
   id: 'org.stremio.ai-arabic-subtitles',
   version: '1.0.0',
-  name: 'ترجمة عربية بالذكاء الاصطناعي (Gemini)',
+  name: 'subtitle bridge pro',
   description:
     'تجلب الترجمة الإنجليزية المتوافقة مع نسخة الفيديو المشغّلة (عبر hash) وتترجمها فوراً إلى العربية الفصحى باستخدام Gemini، مع الحفاظ التام على التوقيت وذاكرة مصطلحات لكل مسلسل لضمان اتساق الترجمة بين الحلقات.',
   logo: 'https://i.imgur.com/8Z8Z8Z8.png',
