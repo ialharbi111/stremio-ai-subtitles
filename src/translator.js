@@ -12,6 +12,9 @@ const BATCH_SIZE = 90; // عدد أسطر الحوار في كل طلب - يوا
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// طابور عالمي يضمن عدم تداخل أي طلبات لـ Gemini من أي مكان في التطبيق
+let globalQueue = Promise.resolve();
+
 function buildSystemInstruction({ glossary, styleNotes }) {
   let glossaryBlock = '';
   if (glossary && glossary.length > 0) {
@@ -45,11 +48,13 @@ function chunkArray(arr, size) {
 }
 
 function extractJsonArray(rawText) {
-  // Gemini قد يحيط الرد بـ ```json ... ``` أحياناً رغم التوجيه، نزيلها احتياطاً
   const cleaned = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
   return JSON.parse(cleaned);
 }
 
+/**
+ * دالة الترجمة الأساسية للـ Batch الواحد
+ */
 async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
   const model = genAI.getGenerativeModel({
     model: MODEL_NAME,
@@ -61,7 +66,6 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
   });
 
   const prompt = JSON.stringify(batch);
-
   const result = await model.generateContent(prompt);
   const rawText = result.response.text();
 
@@ -70,11 +74,10 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
     translated = extractJsonArray(rawText);
   } catch (err) {
     if (attempt < 2) {
-      // إعادة محاولة واحدة عند فشل تحليل الـ JSON
       return translateBatch({ batch, systemInstruction, attempt: attempt + 1 });
     }
     console.warn('فشل تحليل رد Gemini كـ JSON، سيتم إبقاء النص الأصلي لهذه الدفعة');
-    return batch; // كحل أخير، لا نفقد السطر بل نرجع النص الإنجليزي
+    return batch;
   }
 
   if (!Array.isArray(translated) || translated.length !== batch.length) {
@@ -89,8 +92,26 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
 }
 
 /**
- * الدالة الرئيسية: تأخذ ملف SRT إنجليزي كامل وتُعيد نسخته العربية
- * مع الحفاظ الكامل على التوقيت والترقيم (لأننا لا نرسلهما لـ Gemini أصلاً).
+ * دالة وسيطة تجبر الطلبات على المرور عبر "الطابور الموحد" وتفرض تأخير 4.5 ثانية بين كل عملية وأخرى
+ */
+function queuedTranslateBatch({ batch, systemInstruction }) {
+  return new Promise((resolve, reject) => {
+    // نربط الطلب الحالي بنهاية الطابور العالمي
+    globalQueue = globalQueue.then(async () => {
+      // ننتظر 4.5 ثوانٍ كاملة قبل إرسال الطلب لـ Gemini لضمان عدم تخطي الـ Rate Limit
+      await delay(4500);
+      try {
+        const res = await translateBatch({ batch, systemInstruction });
+        resolve(res);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+/**
+ * الدالة الرئيسية للترجمة
  */
 async function translateSrt({ srtContent, imdbId, season }) {
   const entries = parseSrt(srtContent);
@@ -103,7 +124,7 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const texts = entries.map((e) => e.text);
 
-  const seriesKey = imdbId; // يمكن تعديلها لاحقاً لتكون خاصة بالموسم إن رغبت
+  const seriesKey = imdbId;
   const glossary = getGlossaryForSeries(seriesKey);
   const styleNotes = getStyleNotes(seriesKey);
   const systemInstruction = buildSystemInstruction({ glossary, styleNotes });
@@ -113,31 +134,25 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const translatedBatches = [];
 
-  // معالجة الدفعات بالتتالي واحداً تلو الآخر لتجنب خطأ الـ Rate Limit لـ Gemini Free Tier
+  // نمر على الدفعات ونرسلها عبر الطابور الموحد بالتتالي
   for (let i = 0; i < batches.length; i++) {
-    console.log(`⏳ جاري ترجمة الدفعة ${i + 1} من أصل ${batches.length}...`);
-    const startTime = Date.now();
-
+    console.log(`⏳ [طابور الانتظار] تجهيز الدفعة ${i + 1} من أصل ${batches.length}...`);
+    
     try {
-      const translatedBatch = await translateBatch({ batch: batches[i], systemInstruction });
+      // نستدعي الدالة المجدولة في الطابور بدلاً من translateBatch مباشرة
+      const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
       translatedBatches.push(translatedBatch);
+      console.log(`✅ تم ترجمة الدفعة ${i + 1} بنجاح.`);
     } catch (err) {
-      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم المحاولة مجدداً بعد 10 ثوانٍ...`);
-      await delay(10000); // فترة نقاهة 10 ثوانٍ قبل إعادة المحاولة
-      const translatedBatch = await translateBatch({ batch: batches[i], systemInstruction });
-      translatedBatches.push(translatedBatch);
-    }
-
-    // الانتظار الإلزامي لمنع تخطي 15 طلباً بالدقيقة (Free Tier Rate Limit)
-    // نضع 4.5 ثانية (4500ms) كأمان تام بين انطلاق كل طلب وتاليه
-    const duration = Date.now() - startTime;
-    const requiredDelay = 4500; 
-
-    if (i < batches.length - 1) {
-      const sleepTime = Math.max(0, requiredDelay - duration);
-      if (sleepTime > 0) {
-        console.log(`😴 الانتظار لمدة ${(sleepTime / 1000).toFixed(1)} ثانية لتفادي الـ Rate Limit لـ Gemini...`);
-        await delay(sleepTime);
+      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم إعادة المحاولة بإدراجها بالطابور مجدداً بعد 10 ثوانٍ...`);
+      await delay(10000);
+      try {
+        const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
+        translatedBatches.push(translatedBatch);
+        console.log(`✅ تم ترجمة الدفعة ${i + 1} في محاولة الإعادة.`);
+      } catch (retryErr) {
+        console.error(`❌ فشلت المحاولة الثانية للدفعة ${i + 1}، سيتم استخدام النص الأصلي.`);
+        translatedBatches.push(batches[i]);
       }
     }
   }
@@ -150,7 +165,6 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const arabicSrt = buildSrt(entries);
 
-  // تحديث ذاكرة المصطلحات في الخلفية دون تأخير الاستجابة للمستخدم
   updateGlossaryInBackground({ imdbId: seriesKey, texts, translatedTexts }).catch((err) => {
     console.warn('تعذّر تحديث ذاكرة المصطلحات:', err.message);
   });
@@ -159,11 +173,9 @@ async function translateSrt({ srtContent, imdbId, season }) {
 }
 
 /**
- * يستخرج أسماء الشخصيات والمصطلحات المتكررة من هذه الحلقة ويحفظها
- * لتُستخدم في ترجمة الحلقات القادمة من نفس المسلسل (اتساق الأسلوب).
+ * تحديث ذاكرة المصطلحات
  */
 async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
-  // نأخذ عينة من الأزواج بدل إرسال الحلقة كاملة مرة أخرى لتوفير الوقت والتكلفة
   const sampleSize = Math.min(120, texts.length);
   const step = Math.max(1, Math.floor(texts.length / sampleSize));
   const pairs = [];
@@ -180,13 +192,21 @@ async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
     },
   });
 
-  const result = await model.generateContent(JSON.stringify(pairs));
-  const rawText = result.response.text();
-  const terms = extractJsonArray(rawText);
+  // ندرج استدعاء الـ Glossary أيضاً تحت الطابور لحمايته من الـ Rate Limit
+  globalQueue = globalQueue.then(async () => {
+    await delay(4500);
+    try {
+      const result = await model.generateContent(JSON.stringify(pairs));
+      const rawText = result.response.text();
+      const terms = extractJsonArray(rawText);
 
-  if (Array.isArray(terms) && terms.length > 0) {
-    upsertGlossaryTerms(imdbId, terms);
-  }
+      if (Array.isArray(terms) && terms.length > 0) {
+        upsertGlossaryTerms(imdbId, terms);
+      }
+    } catch (err) {
+      console.warn('تعذر استخراج المصطلحات في الخلفية:', err.message);
+    }
+  });
 }
 
 module.exports = { translateSrt };
