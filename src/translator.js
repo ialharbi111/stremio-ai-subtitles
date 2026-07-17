@@ -4,7 +4,7 @@ const { getGlossaryForSeries, upsertGlossaryTerms, getStyleNotes } = require('./
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const MODEL_NAME = 'gemini-1.5-flash';
+const MODEL_NAME = 'gemini-flash-latest'; // alias يتحدّث تلقائياً لأحدث نموذج Flash متوفر من Google
 const BATCH_SIZE = 90; // عدد أسطر الحوار في كل طلب - يوازن بين السرعة وحجم الاستجابة
 
 function buildSystemInstruction({ glossary, styleNotes }) {
