@@ -35,6 +35,11 @@ async function searchSubtitles({ imdbId, season, episode }) {
   return singleEpisode || subs[0];
 }
 
+function isZipBuffer(buffer) {
+  // ملفات ZIP تبدأ دائماً بالبايتات 0x50 0x4B ('P','K')
+  return buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+}
+
 async function downloadAndExtractSrt(subtitleEntry) {
   const url = subtitleEntry.url.startsWith('http')
     ? subtitleEntry.url
@@ -49,13 +54,14 @@ async function downloadAndExtractSrt(subtitleEntry) {
   });
   const buffer = Buffer.from(res.data);
 
-  // معظم ملفات SubDL تُرجع كأرشيف zip، نفكه ونطلع أول ملف srt بداخله
-  if (url.toLowerCase().endsWith('.zip')) {
+  // نتحقق من بصمة الملف الفعلية بدل الاعتماد على شكل الرابط (الروابط الحقيقية قد تحتوي توكنز/باراميترز)
+  if (isZipBuffer(buffer)) {
     const zip = await JSZip.loadAsync(buffer);
     const srtFileName = Object.keys(zip.files).find((name) => name.toLowerCase().endsWith('.srt'));
     if (!srtFileName) {
       throw new Error('لا يوجد ملف srt داخل الأرشيف المضغوط من SubDL');
     }
+    console.log(`📦 تم فك ضغط الملف من SubDL: ${srtFileName}`);
     return zip.files[srtFileName].async('string');
   }
 
