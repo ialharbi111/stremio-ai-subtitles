@@ -12,8 +12,27 @@ const BATCH_SIZE = 90; // عدد أسطر الحوار في كل طلب - يوا
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// طابور عالمي يضمن عدم تداخل أي طلبات لـ Gemini من أي مكان في التطبيق
-let globalQueue = Promise.resolve();
+// متغير عالمي لحفظ وقت آخر طلب تم إرساله لـ Gemini على مستوى السيرفر بالكامل
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 5000; // 5 ثوانٍ كحد أدنى بين أي طلبين لـ Gemini (أمان تام لـ Free Tier)
+
+/**
+ * منظم الطلبات العالمي: يضمن عدم خروج أي طلب لـ Gemini قبل مرور 5 ثوانٍ على الطلب السابق
+ */
+async function throttledGenerateContent(model, prompt) {
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  
+  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+    const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+    await delay(waitTime);
+  }
+  
+  // تحديث وقت الطلب فوراً لحجز الدور للطلب التالي
+  lastRequestTime = Date.now();
+  
+  return await model.generateContent(prompt);
+}
 
 function buildSystemInstruction({ glossary, styleNotes }) {
   let glossaryBlock = '';
@@ -34,7 +53,7 @@ ${lines}
 2. حافظ على المعنى والنبرة (فكاهي، جاد، عاطفي...) بما يناسب السياق.
 3. لا تترجم حرفياً كلمة بكلمة؛ اجعل الجملة تبدو طبيعية بالعربية.
 4. حافظ على علامات الترقيم المناسبة للعربية.
-5. إذا كان النص يحتوي على اسم علم (شخصية) لم يرد في القائمة أدناه، اختر نقحرة عربية ثابتة له والتزم بها.
+5. إذا كان النص يحتوي على اسم علم (شخصية) لم يرد في القائمة أدناه, اختر نقحرة عربية ثابتة له والتزم بها.
 6. أعد النتيجة بصيغة JSON فقط (مصفوفة نصوص) بنفس عدد وترتيب العناصر المُدخلة، دون أي نص إضافي قبلها أو بعدها.
 ${glossaryBlock}${styleBlock}`;
 }
@@ -53,9 +72,9 @@ function extractJsonArray(rawText) {
 }
 
 /**
- * دالة الترجمة الأساسية للـ Batch الواحد
+ * ترجمة الدفعة مع آلية إعادة المحاولة الذكية والمستقلة (حتى 3 محاولات)
  */
-async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
+async function translateBatchWithRetry({ batch, systemInstruction, maxAttempts = 3 }) {
   const model = genAI.getGenerativeModel({
     model: MODEL_NAME,
     systemInstruction,
@@ -66,52 +85,34 @@ async function translateBatch({ batch, systemInstruction, attempt = 1 }) {
   });
 
   const prompt = JSON.stringify(batch);
-  const result = await model.generateContent(prompt);
-  const rawText = result.response.text();
 
-  let translated;
-  try {
-    translated = extractJsonArray(rawText);
-  } catch (err) {
-    if (attempt < 2) {
-      return translateBatch({ batch, systemInstruction, attempt: attempt + 1 });
-    }
-    console.warn('فشل تحليل رد Gemini كـ JSON، سيتم إبقاء النص الأصلي لهذه الدفعة');
-    return batch;
-  }
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // إرسال الطلب عبر المنظم العالمي المفرمل للسرعة
+      const result = await throttledGenerateContent(model, prompt);
+      const rawText = result.response.text();
+      const translated = extractJsonArray(rawText);
 
-  if (!Array.isArray(translated) || translated.length !== batch.length) {
-    if (attempt < 2) {
-      return translateBatch({ batch, systemInstruction, attempt: attempt + 1 });
-    }
-    console.warn('عدد العناصر المُترجمة لا يطابق الأصل، سيتم إبقاء النص الأصلي لهذه الدفعة');
-    return batch;
-  }
-
-  return translated;
-}
-
-/**
- * دالة وسيطة تجبر الطلبات على المرور عبر "الطابور الموحد" وتفرض تأخير أمن جداً بين كل عملية وأخرى
- */
-function queuedTranslateBatch({ batch, systemInstruction }) {
-  return new Promise((resolve, reject) => {
-    // نربط الطلب الحالي بنهاية الطابور العالمي
-    globalQueue = globalQueue.then(async () => {
-      // ننتظر 8 ثوانٍ كاملة (8000ms) للأمان القصوى لضمان عدم تخطي الـ Rate Limit
-      await delay(8000);
-      try {
-        const res = await translateBatch({ batch, systemInstruction });
-        resolve(res);
-      } catch (err) {
-        reject(err);
+      if (Array.isArray(translated) && translated.length === batch.length) {
+        return translated;
       }
-    });
-  });
+      throw new Error("الترجمة المستلمة لا تطابق عدد الأسطر الأصلي أو ليست مصفوفة صالحة.");
+    } catch (err) {
+      console.error(`⚠️ فشلت الدفعة (محاولة ${attempt}/${maxAttempts}) بسبب: ${err.message}`);
+      if (attempt < maxAttempts) {
+        const cooldown = attempt * 6000; // فترة نقاهة تزيد تصاعدياً (6 ثوانٍ، ثم 12 ثانية)
+        console.log(`😴 الانتظار لمدة ${cooldown / 1000} ثانية كفترة نقاهة قبل إعادة المحاولة...`);
+        await delay(cooldown);
+      }
+    }
+  }
+
+  console.warn('❌ فشلت جميع المحاولات لهذه الدفعة، سيتم استخدام النص الأصلي كملجأ أخير.');
+  return batch;
 }
 
 /**
- * الدالة الرئيسية للترجمة
+ * الدالة الرئيسية: تأخذ ملف SRT إنجليزي كامل وتُعيد نسخته العربية
  */
 async function translateSrt({ srtContent, imdbId, season }) {
   const entries = parseSrt(srtContent);
@@ -124,7 +125,7 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const texts = entries.map((e) => e.text);
 
-  const seriesKey = imdbId;
+  const seriesKey = imdbId; 
   const glossary = getGlossaryForSeries(seriesKey);
   const styleNotes = getStyleNotes(seriesKey);
   const systemInstruction = buildSystemInstruction({ glossary, styleNotes });
@@ -134,26 +135,14 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const translatedBatches = [];
 
-  // نمر على الدفعات ونرسلها عبر الطابور الموحد بالتتالي
+  // معالجة الدفعات بالتوالي وبشكل منظم وآمن تماماً
   for (let i = 0; i < batches.length; i++) {
-    console.log(`⏳ [طابور الانتظار] تجهيز الدفعة ${i + 1} من أصل ${batches.length}...`);
+    console.log(`⏳ جاري ترجمة الدفعة ${i + 1} من أصل ${batches.length}...`);
     
-    try {
-      const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
-      translatedBatches.push(translatedBatch);
-      console.log(`✅ تم ترجمة الدفعة ${i + 1} بنجاح.`);
-    } catch (err) {
-      console.log(`⚠️ فشلت الدفعة ${i + 1}، سيتم إعادة المحاولة بعد فترة نقاهة (15 ثانية)...`);
-      await delay(15000); // فترة نقاهة أطول عند الفشل
-      try {
-        const translatedBatch = await queuedTranslateBatch({ batch: batches[i], systemInstruction });
-        translatedBatches.push(translatedBatch);
-        console.log(`✅ تم ترجمة الدفعة ${i + 1} في محاولة الإعادة.`);
-      } catch (retryErr) {
-        console.error(`❌ فشلت المحاولة الثانية للدفعة ${i + 1}، سيتم استخدام النص الأصلي.`);
-        translatedBatches.push(batches[i]);
-      }
-    }
+    const translatedBatch = await translateBatchWithRetry({ batch: batches[i], systemInstruction });
+    translatedBatches.push(translatedBatch);
+    
+    console.log(`✅ انتهت معالجة الدفعة ${i + 1}.`);
   }
 
   const translatedTexts = translatedBatches.flat();
@@ -164,9 +153,47 @@ async function translateSrt({ srtContent, imdbId, season }) {
 
   const arabicSrt = buildSrt(entries);
 
-  // تم إلغاء تحديث المصطلحات بالخلفية مؤقتاً لتوفير الـ Quota للترجمة الفعلية
+  // تحديث ذاكرة المصطلحات في الخلفية (تم تمريرها عبر المنظم لتفادي تعارض الـ Rate Limit)
+  updateGlossaryInBackground({ imdbId: seriesKey, texts, translatedTexts }).catch((err) => {
+    console.warn('تعذّر تحديث ذاكرة المصطلحات:', err.message);
+  });
 
   return arabicSrt;
+}
+
+/**
+ * يستخرج أسماء الشخصيات والمصطلحات المتكررة من هذه الحلقة ويحفظها
+ */
+async function updateGlossaryInBackground({ imdbId, texts, translatedTexts }) {
+  const sampleSize = Math.min(120, texts.length);
+  const step = Math.max(1, Math.floor(texts.length / sampleSize));
+  const pairs = [];
+  for (let i = 0; i < texts.length; i += step) {
+    pairs.push({ en: texts[i], ar: translatedTexts[i] });
+  }
+
+  const model = genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    systemInstruction: `مهمتك استخراج أسماء الأعلام (شخصيات، أماكن، ألقاب) والتعبيرات المتكررة المهمة فقط من أزواج الجمل (إنجليزي/عربي) التالية، وإرجاعها كمصفوفة JSON بالشكل: [{"en": "...", "ar": "..."}]. تجاهل الجمل العادية. أرجع مصفوفة فارغة [] إن لم تجد شيئاً مهماً. لا تُرجع أي نص خارج الـ JSON.`,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.1,
+    },
+  });
+
+  try {
+    // إرسال طلب المصطلحات عبر منظم البوابة الموحد لعدم تخطي الـ Rate Limit
+    const result = await throttledGenerateContent(model, JSON.stringify(pairs));
+    const rawText = result.response.text();
+    const terms = extractJsonArray(rawText);
+
+    if (Array.isArray(terms) && terms.length > 0) {
+      upsertGlossaryTerms(imdbId, terms);
+      console.log('✨ تم تحديث ذاكرة المصطلحات للمسلسل بنجاح في الخلفية.');
+    }
+  } catch (err) {
+    console.warn('⚠️ تعذر استخراج المصطلحات في الخلفية بسبب تعارض بالـ Rate Limit:', err.message);
+  }
 }
 
 module.exports = { translateSrt };
